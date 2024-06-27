@@ -2,29 +2,20 @@
 using Microsoft.Extensions.Configuration;
 using spotify_dl.Services;
 
-namespace spotify_dl
-{
-    class Program
-    {
-        static void Main(string[] args)
-        {
-            var configuration = new ConfigurationBuilder()
+var configuration = new ConfigurationBuilder()
                 .SetBasePath(AppContext.BaseDirectory)
                 .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
                 .Build();
 
-            var telegramBotToken = configuration["TelegramBotToken"];
-            var spotifyClientId = configuration["SpotifyClientId"];
-            var spotifyClientSecret = configuration["SpotifyClientSecret"];
+var telegramBotToken = configuration["TelegramBotToken"];
+var spotifyClientId = configuration["SpotifyClientId"];
+var spotifyClientSecret = configuration["SpotifyClientSecret"];
 
-            var spotifyService = new SpotifyService(spotifyClientId, spotifyClientSecret);
-            var youtubeService = new YoutubeService();
-            var telegramBotService = new TelegramBotService(telegramBotToken, spotifyService, youtubeService);
+var spotifyService = new SpotifyService(spotifyClientId, spotifyClientSecret);
+var youtubeService = new YoutubeService();
+var telegramBotService = new TelegramBotService(telegramBotToken, spotifyService, youtubeService);
 
-            telegramBotService.Start();
+telegramBotService.Start();
 
-            Console.WriteLine("Press any key to exit...");
-            Console.ReadKey();
-        }
-    }
-}
+Console.WriteLine("Press any key to exit...");
+Console.ReadKey();
