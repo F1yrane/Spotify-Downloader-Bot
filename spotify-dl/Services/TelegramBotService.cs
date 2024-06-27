@@ -32,7 +32,7 @@ namespace spotify_dl.Services
         {
             var receiverOptions = new ReceiverOptions
             {
-                AllowedUpdates = [] // получать все типы апдейтов
+                AllowedUpdates = []
             };
 
             _botClient.StartReceiving(
