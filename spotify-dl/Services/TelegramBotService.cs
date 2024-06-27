@@ -1,12 +1,17 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using Serilog;
 using SpotifyAPI.Web;
 using Telegram.Bot;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using File = System.IO.File;
 
 namespace spotify_dl.Services
 {
@@ -27,7 +32,7 @@ namespace spotify_dl.Services
         {
             var receiverOptions = new ReceiverOptions
             {
-                AllowedUpdates = Array.Empty<UpdateType>()
+                AllowedUpdates = [] // получать все типы апдейтов
             };
 
             _botClient.StartReceiving(
@@ -37,6 +42,7 @@ namespace spotify_dl.Services
             );
 
             Console.WriteLine("Bot started.");
+            Log.Information("Bot started.");
         }
 
         private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
@@ -46,143 +52,271 @@ namespace spotify_dl.Services
 
             var message = update.Message;
 
-            if (message.Text.StartsWith("https://open.spotify.com/playlist/"))
+            switch (message.Text)
             {
+                case string text when text.StartsWith("https://open.spotify.com/playlist/"):
+                    await HandlePlaylistLinkAsync(message);
+                    break;
+                case string text when text.StartsWith("https://open.spotify.com/track/"):
+                    await HandleTrackLinkAsync(message);
+                    break;
+                case string text when text.StartsWith("https://open.spotify.com/album/"):
+                    await HandleAlbumLinkAsync(message);
+                    break;
+                case string text when int.TryParse(text, out int trackNumber):
+                    await HandleTrackNumberAsync(message, trackNumber);
+                    break;
+                case "/download":
+                    await HandleDownloadCommandAsync(message);
+                    break;
+                default:
+                    await SendWelcomeMessageAsync(message);
+                    break;
+            }
+        }
+
+        private async Task HandlePlaylistLinkAsync(Message message)
+        {
+            try
+            {
+                var playlistId = message.Text.Split('/').Last().Split('?').First();
+                Log.Information("Received playlist ID: {PlaylistId}", playlistId);
+                var playlist = await _spotifyService.GetPlaylistAsync(playlistId);
+
+                await SendPlaylistMessageAsync(message.Chat.Id, playlist);
+            }
+            catch (ArgumentException ex)
+            {
+                Log.Error(ex, "Invalid playlist link");
+                await SendErrorMessageAsync(
+                    message.Chat.Id, 
+                    "Sorry, I can't find the playlist on the link, maybe it's invalid," +
+                    " try again and make sure it matches the input format.");
+            }
+        }
+
+        private async Task HandleTrackLinkAsync(Message message)
+        {
+            try
+            {
+                var trackId = message.Text.Split('/').Last().Split('?').First();
+                Log.Information("Received track ID: {TrackId}", trackId);
+                var track = await _spotifyService.GetTrackAsync(trackId);
+
+                await _botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    $"Track: {track.Name} - {track.Artists.First().Name}"
+                );
+            }
+            catch (ArgumentException ex)
+            {
+                Log.Error(ex, "Invalid track link");
+                await SendErrorMessageAsync(message.Chat.Id, 
+                    "Sorry, I can't find the track on the link, maybe it's invalid," +
+                    " try again and make sure it matches the input format.");
+            }
+        }
+
+        private async Task HandleAlbumLinkAsync(Message message)
+        {
+            try
+            {
+                var albumId = message.Text.Split('/').Last().Split('?').First();
+                Log.Information("Received album ID: {AlbumId}", albumId);
+                var album = await _spotifyService.GetAlbumAsync(albumId);
+
+                var trackList = album.Tracks.Items.Select((item, index) =>
+                {
+                    var track = item;
+                    return $"{index + 1}. {track.Name} - {track.Artists.First().Name}";
+                }).ToList();
+
+                var trackMessage = string.Join("\n", trackList);
+
+                await _botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    $"Album: {album.Name}\n{trackMessage}"
+                );
+            }
+            catch (ArgumentException ex)
+            {
+                Log.Error(ex, "Invalid album link");
+                await SendErrorMessageAsync(message.Chat.Id, "Sorry, I can't find the album on the link, maybe it's invalid, try again and make sure it matches the input format.");
+            }
+        }
+
+        private async Task HandleTrackNumberAsync(Message message, int trackNumber)
+        {
+            if (PlaylistContext.UserPlaylists.TryGetValue(message.Chat.Id, out var playlist)
+                && playlist.Tracks != null && playlist.Tracks.Items != null)
+            {
+                await _botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    "Please wait until the track is loaded and sent to you"
+                );
+
                 try
                 {
-                    var playlistId = message.Text.Split('/').Last().Split('?').First();
-                    var playlist = await _spotifyService.GetPlaylistAsync(playlistId);
+                    var track = (FullTrack)playlist.Tracks.Items[trackNumber - 1].Track;
+                    var youtubeUrl = await _youtubeService.SearchYoutubeUrlAsync(track.Name, track.Artists.First().Name);
 
-                    if (playlist.Tracks != null && playlist.Tracks.Items != null)
+                    if (youtubeUrl != null)
                     {
-                        var trackList = playlist.Tracks.Items.Select((item, index) =>
-                        {
-                            var track = (FullTrack)item.Track;
-                            return $"{index + 1}. {track.Name} - {track.Artists.First().Name}";
-                        }).ToList();
-                        var trackMessage = string.Join("\n", trackList);
+                        var outputPath = $"{track.Name}.mp3";
+                        await _youtubeService.DownloadTrackAsync(youtubeUrl, outputPath);
 
-                        await _botClient.SendTextMessageAsync(
-                            chatId: message.Chat.Id,
-                            text: $"Playlist: {playlist.Name}\n{trackMessage}"
+                        using var stream = File.OpenRead(outputPath);
+                        var inputOnlineFile = new InputFileStream(stream, $"{track.Name}.mp3");
+
+                        await _botClient.SendDocumentAsync(
+                            message.Chat.Id,
+                            inputOnlineFile
                         );
 
-                        PlaylistContext.UserPlaylists[message.Chat.Id] = playlist;
+                        Log.Information("Sent track {TrackName} to user {UserId}", track.Name, message.Chat.Id);
+                        stream.Close();
+                        File.Delete(outputPath);
                     }
                     else
                     {
                         await _botClient.SendTextMessageAsync(
-                            chatId: message.Chat.Id,
-                            text: $"Playlist: {playlist.Name}\n{"Sorry, no tracks found in the playlist."}"
+                            message.Chat.Id,
+                            "The track was not found in free sources."
                         );
                     }
                 }
-                catch (ArgumentException)
+                catch (ArgumentOutOfRangeException ex)
                 {
+                    Log.Error(ex, "Track number {TrackNumber} not found in playlist", trackNumber);
                     await _botClient.SendTextMessageAsync(
-                        chatId: message.Chat.Id,
-                        text: "Sorry, I can't find the playlist on the link, maybe it's invalid, " +
-                        "try again and make sure it matches the input format."
+                        message.Chat.Id,
+                        $"Sorry, but there is no track number {trackNumber} in the playlist"
                     );
                 }
             }
-            else if (int.TryParse(message.Text, out int trackNumber))
+            else
             {
-                if (PlaylistContext.UserPlaylists.TryGetValue(message.Chat.Id, out var playlist)
-                    && playlist.Tracks != null && playlist.Tracks.Items != null)
-                {
-                    await _botClient.SendTextMessageAsync(message.Chat.Id, "Please wait until the track is loaded and sent to you");
+                await _botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    "Please send me the playlist link first."
+                );
+            }
+        }
 
-                    try
+        private async Task HandleDownloadCommandAsync(Message message)
+        {
+            if (PlaylistContext.UserPlaylists.TryGetValue(message.Chat.Id, out var playlist)
+                && playlist.Tracks != null && playlist.Tracks.Items != null)
+            {
+                await _botClient.SendTextMessageAsync(
+                    message.Chat.Id,
+                    "Please wait while the playlist is downloaded and archived, " +
+                    "it may take some time depending on the number of tracks in the playlist.\n" +
+                    "The approximate loading time of one track ~ 30 seconds."
+                );
+
+                try
+                {
+                    var trackFiles = new List<string>();
+
+                    foreach (var item in playlist.Tracks.Items)
                     {
-                        var track = (FullTrack)playlist.Tracks.Items[trackNumber - 1].Track;
+                        var track = (FullTrack)item.Track;
                         var youtubeUrl = await _youtubeService.SearchYoutubeUrlAsync(track.Name, track.Artists.First().Name);
 
                         if (youtubeUrl != null)
                         {
                             var outputPath = $"{track.Name}.mp3";
                             await _youtubeService.DownloadTrackAsync(youtubeUrl, outputPath);
-
-                            using var stream = System.IO.File.OpenRead(outputPath);
-                            var inputOnlineFile = new InputFileStream(stream, $"{track.Name}.mp3");
-                            await _botClient.SendDocumentAsync(message.Chat.Id, inputOnlineFile);
-                        }
-                        else
-                        {
-                            await _botClient.SendTextMessageAsync(message.Chat.Id, "The track was not found in free sources.");
+                            trackFiles.Add(outputPath);
                         }
                     }
-                    catch (ArgumentOutOfRangeException)
+
+                    var zipPath = $"{playlist.Name}.zip";
+                    using (var zipStream = new FileStream(zipPath, FileMode.Create))
+                    using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
                     {
-                        await _botClient.SendTextMessageAsync(message.Chat.Id, $"Sorry, but there is no track number {trackNumber} in the playlist");
+                        foreach (var trackFile in trackFiles)
+                        {
+                            archive.CreateEntryFromFile(trackFile, Path.GetFileName(trackFile));
+                        }
                     }
 
+                    using var stream = File.OpenRead(zipPath);
+                    var inputOnlineFile = new InputFileStream(stream, $"{playlist.Name}.zip");
+                    await _botClient.SendDocumentAsync(
+                        message.Chat.Id,
+                        inputOnlineFile
+                    );
+
+                    Log.Information("Sent playlist {PlaylistName} to user {UserId}", playlist.Name, message.Chat.Id);
+                    stream.Close();
+                    File.Delete(zipPath);
+                    trackFiles.ForEach(File.Delete);
                 }
-                else
+                catch (Exception ex)
                 {
-                    await _botClient.SendTextMessageAsync(message.Chat.Id, "The track was not found.");
+                    Log.Error(ex, "An error occurred while downloading the playlist.");
+                    await _botClient.SendTextMessageAsync(
+                        message.Chat.Id,
+                        "An error occurred while downloading the playlist."
+                    );
                 }
             }
-            else if (message.Text == "/download")
+        }
+
+        private async Task SendWelcomeMessageAsync(Message message)
+        {
+            await _botClient.SendTextMessageAsync(
+                message.Chat.Id,
+                $"Hey, {message.Chat.FirstName} 👋\n" +
+                $"\n1) To get started, copy the URL link to the spotify playlist in the format ( https://open.spotify.com/playlist/ ) and paste it into the chat\n" +
+                $"\n2) After a while, you will receive a list from the playlist, you can send the /download command to download all tracks in a ZIP-Archive\n" +
+                $"\n3) Or send the track number to download a specific track from the list"
+            );
+
+            Log.Information("Sent welcome message to user {UserId}", message.Chat.Id);
+        }
+
+        private async Task SendPlaylistMessageAsync(long chatId, FullPlaylist playlist)
+        {
+            if (playlist.Tracks != null && playlist.Tracks.Items != null)
             {
-                if (PlaylistContext.UserPlaylists.TryGetValue(message.Chat.Id, out var playlist)
-                    && playlist.Tracks != null && playlist.Tracks.Items != null)
+                var trackList = playlist.Tracks.Items.Select((item, index) =>
                 {
-                    await _botClient.SendTextMessageAsync(message.Chat.Id, "Please wait while the playlist is downloaded and archived, " +
-                        "it may take some time dependeing on the number of tracks in the playlist.\n" +
-                        "The approximate loading time of one track ~ 30 seconds.");
+                    var track = (FullTrack)item.Track;
+                    return $"{index + 1}. {track.Name} - {track.Artists.First().Name}";
+                }).ToList();
 
-                    try
-                    {
-                        var trackFiles = new List<string>();
+                var trackMessage = string.Join("\n", trackList);
 
-                        foreach (var item in playlist.Tracks.Items)
-                        {
-                            var track = (FullTrack)item.Track;
-                            var youtubeUrl = await _youtubeService.SearchYoutubeUrlAsync(track.Name, track.Artists.First().Name);
+                await _botClient.SendTextMessageAsync(
+                    chatId,
+                    $"Playlist: {playlist.Name}\n{trackMessage}"
+                );
 
-                            if (youtubeUrl != null)
-                            {
-                                var outputPath = $"{track.Name}.mp3";
-                                await _youtubeService.DownloadTrackAsync(youtubeUrl, outputPath);
-                                trackFiles.Add(outputPath);
-                            }
-                        }
-
-                        var zipPath = $"{playlist.Name}.zip";
-                        using (var zipStream = new FileStream(zipPath, FileMode.Create))
-                        using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
-                        {
-                            foreach (var trackFile in trackFiles)
-                            {
-                                archive.CreateEntryFromFile(trackFile, Path.GetFileName(trackFile));
-                            }
-                        }
-
-                        using var stream = System.IO.File.OpenRead(zipPath);
-                        var inputOnlineFile = new InputFileStream(stream, $"{playlist.Name}.zip");
-                        await _botClient.SendDocumentAsync(message.Chat.Id, inputOnlineFile);
-                    }
-                    catch (Exception ex)
-                    {
-                        await _botClient.SendTextMessageAsync(message.Chat.Id, "An error occurred while downloading the playlist.");
-                        Console.WriteLine(ex);
-                    }
-                }
+                PlaylistContext.UserPlaylists[chatId] = playlist;
             }
-
             else
             {
-                await _botClient.SendTextMessageAsync(message.Chat.Id, $"Hey, {message.Chat.FirstName} 👋\n" +
-                    $"\n1) To get started, copy the URL link to the spotify playlist in the format ( https://open.spotify.com/playlist/ ) and paste it into the chat\n" +
-                    $"\n2) After a while, you will recieve a list from the playlist, you can send the /download command to download all tracks in a ZIP-Archive\n" +
-                    $"\n3) Or send the track number to download a specific track from the list");
+                await _botClient.SendTextMessageAsync(
+                    chatId,
+                    $"Playlist: {playlist.Name}\n{"Sorry, no tracks found in the playlist."}"
+                );
             }
+        }
+
+        private async Task SendErrorMessageAsync(long chatId, string errorMessage)
+        {
+            await _botClient.SendTextMessageAsync(
+                chatId,
+                errorMessage
+            );
         }
 
         private Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
         {
-            Console.WriteLine(exception);
+            Log.Error(exception, "Error occurred in Telegram Bot");
             return Task.CompletedTask;
         }
     }
